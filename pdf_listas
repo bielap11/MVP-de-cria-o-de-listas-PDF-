@@ -1,0 +1,194 @@
+"""
+pdf_listas.py - camada de PDF do app "criativa ferramentas".
+
+Este arquivo NÃO conhece a interface (customtkinter / tksheet).
+Ele só recebe dados (DataFrame, título, informações) e devolve dados.
+Por isso dá para testá-lo sozinho, sem abrir nenhuma janela.
+"""
+
+from datetime import date
+from xml.sax.saxutils import escape
+
+import pandas as pd
+import pdfplumber
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    Flowable,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+# Cabeçalho da última coluna, a das caixinhas de marcar a caneta.
+# Ao LER um PDF, essa coluna é descartada (ela só existe no papel).
+COLUNA_CHECK = "OK"
+
+
+class CaixaVazia(Flowable):
+    """Um quadradinho vazio desenhado direto no PDF, para marcar com X ou V."""
+
+    def __init__(self, lado=5 * mm):
+        super().__init__()
+        self.lado = lado
+
+    def wrap(self, largura_disponivel, altura_disponivel):
+        # o ReportLab pergunta "quanto espaço você ocupa?"
+        return self.lado, self.lado
+
+    def draw(self):
+        self.canv.setLineWidth(0.8)
+        self.canv.rect(0, 0, self.lado, self.lado)
+
+
+def _larguras_das_colunas(df, largura_total):
+    """ID e caixinha ficam estreitos; o resto divide o espaço pelo tamanho do conteúdo."""
+    largura_id = 12 * mm
+    largura_check = 16 * mm
+    resto = largura_total - largura_id - largura_check
+
+    pesos = []
+    for i in range(1, df.shape[1]):  # por posição: funciona até com nomes repetidos
+        coluna = df.iloc[:, i]
+        maior = max(len(str(df.columns[i])), *(len(str(v)) for v in coluna), 6)
+        pesos.append(min(maior, 30))  # limita para uma coluna não engolir as outras
+
+    soma = sum(pesos)
+    return [largura_id] + [resto * p / soma for p in pesos] + [largura_check]
+
+
+def gerar_pdf(df, caminho, titulo="", info=""):
+    """
+    Cria o PDF da lista.
+
+    df      -> DataFrame; a primeira coluna é o ID
+    caminho -> onde salvar (ex.: "/home/gabriel/lista.pdf")
+    titulo  -> título grande no topo (também vai para os metadados do PDF)
+    info    -> linha de informações curtas (também vai para os metadados)
+    """
+    estilos = getSampleStyleSheet()
+    estilo_celula = ParagraphStyle(
+        "celula", parent=estilos["BodyText"], fontSize=9.5, leading=12
+    )
+    estilo_cabecalho = ParagraphStyle(
+        "cabecalho", parent=estilo_celula, fontName="Helvetica-Bold"
+    )
+
+    # title/subject viram metadados: é assim que conseguimos LER de volta depois
+    doc = SimpleDocTemplate(
+        caminho,
+        pagesize=A4,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title=titulo or "Lista",
+        subject=info or "",
+        author="criativa ferramentas",
+    )
+
+    elementos = [Paragraph(escape(titulo or "Lista"), estilos["Title"])]
+    if info:
+        elementos.append(Paragraph(escape(info), estilos["Normal"]))
+    elementos.append(
+        Paragraph(f"Data: {date.today():%d/%m/%Y}", estilos["Normal"])
+    )
+    elementos.append(Spacer(1, 6 * mm))
+
+    # linha 0 = cabeçalho; as outras = dados + caixinha vazia no fim
+    tabela_dados = [
+        [Paragraph(escape(str(c)), estilo_cabecalho) for c in df.columns]
+        + [Paragraph(COLUNA_CHECK, estilo_cabecalho)]
+    ]
+    for _, linha in df.iterrows():
+        tabela_dados.append(
+            [Paragraph(escape(str(v)), estilo_celula) for v in linha]
+            + [CaixaVazia()]
+        )
+
+    tabela = Table(
+        tabela_dados,
+        colWidths=_larguras_das_colunas(df, doc.width),
+        repeatRows=1,  # repete o cabeçalho se a lista passar de uma página
+    )
+    tabela.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8e8e8")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (-1, 0), (-1, -1), "CENTER"),  # caixinha centralizada
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    elementos.append(tabela)
+    doc.build(elementos)
+
+
+def _limpar(celula):
+    """Células vazias vêm como None; quebras de linha viram espaço."""
+    return (celula or "").replace("\n", " ").strip()
+
+
+def ler_pdf(caminho):
+    """
+    Lê um PDF com tabela e devolve (titulo, info, DataFrame).
+
+    Funciona melhor com PDFs gerados por este app. Para outros PDFs, ele tenta
+    achar a tabela; se não achar, levanta ValueError.
+    """
+    linhas = []
+    with pdfplumber.open(caminho) as pdf:
+        metadados = pdf.metadata or {}
+        titulo = metadados.get("Title", "") or ""
+        info = metadados.get("Subject", "") or ""
+        for pagina in pdf.pages:
+            for tabela in pagina.extract_tables():
+                linhas.extend(tabela)
+
+    if not linhas:
+        raise ValueError("Não encontrei nenhuma tabela neste PDF.")
+
+    cabecalho = [_limpar(c) for c in linhas[0]]
+    dados = []
+    for linha in linhas[1:]:
+        linha = [_limpar(c) for c in linha]
+        if linha == cabecalho:  # cabeçalho repetido nas páginas seguintes
+            continue
+        if not any(linha):  # linha totalmente vazia
+            continue
+        dados.append(linha)
+
+    # descarta a coluna das caixinhas (só existe no papel)
+    if cabecalho and cabecalho[-1] == COLUNA_CHECK:
+        cabecalho = cabecalho[:-1]
+        dados = [linha[:-1] for linha in dados]
+
+    # garante que toda linha tem o mesmo número de colunas do cabeçalho
+    n = len(cabecalho)
+    dados = [(linha + [""] * n)[:n] for linha in dados]
+
+    return titulo, info, pd.DataFrame(dados, columns=cabecalho)
+
+
+if __name__ == "__main__":
+    # teste rápido sem interface: python pdf_listas.py
+    exemplo = pd.DataFrame(
+        {
+            "ID": ["1", "2", "3"],
+            "Código": ["A-001", "A-002", "B-010"],
+            "Nome": ["Parafuso 5mm", "Porca", "Chave de fenda"],
+            "Qtd": ["100", "100", "2"],
+            "Info": ["caixa azul", "", "prateleira 3"],
+        }
+    )
+    gerar_pdf(exemplo, "teste.pdf", "Lista de teste", "Responsável: Gabriel")
+    t, i, d = ler_pdf("teste.pdf")
+    print(t, "|", i)
+    print(d)
